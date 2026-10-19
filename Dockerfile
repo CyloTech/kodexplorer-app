@@ -17,4 +17,10 @@ COPY --chmod=644 scripts/kodbox-install-step.php /scripts/install/kodbox-install
 COPY --chmod=644 scripts/kodbox-install-check.php /scripts/install/kodbox-install-check.php
 COPY --chmod=755 scripts/30_installer.sh /etc/my_init.d/30_installer.sh
 
+# Appbox installed callback: 30_installer.sh only marks it pending and this
+# runit service sends it after my_init.d, so it can never block startup.
+COPY scripts/appbox-installed-callback /usr/local/bin/appbox-installed-callback
+COPY scripts/appbox-callback-run /etc/service/appbox-callback/run
+RUN chmod 755 /usr/local/bin/appbox-installed-callback /etc/service/appbox-callback/run
+
 LABEL net.cylo.kodbox-release="1.70.02-2"

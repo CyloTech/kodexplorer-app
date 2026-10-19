@@ -48,11 +48,10 @@ echo "      *            *..*         :"
 
     echo "Finishing Install"
     # Finish Install
-    until [[ $(curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST "https://api.cylo.io/v1/apps/installed/${INSTANCE_ID}" | grep '200') ]]
-    do
-        sleep 5
-    done
-
-
+    # Only mark the installed callback pending (before the completion marker).
+    # The appbox-callback runit service sends it after my_init.d has finished,
+    # so a slow or rejected callback (the API rejects every callback after the
+    # first) cannot keep Kodbox down.
+    touch /etc/appbox_callback_pending
     touch /etc/installer30_completed
 fi

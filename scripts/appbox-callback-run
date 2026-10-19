@@ -1,0 +1,14 @@
+#!/bin/bash
+# runit service /etc/service/appbox-callback/run: send the pending Appbox
+# installed callback once my_init has run /etc/my_init.d, so a slow or rejected
+# callback can never keep the app from starting. appbox-installed-callback
+# retries network errors, 408, 429 and 5xx and logs any other status once
+# without retrying. The flag is removed after the attempt, then the service
+# idles so runit does not run it again.
+
+if [[ -f /etc/appbox_callback_pending ]]; then
+    /usr/local/bin/appbox-installed-callback
+    rm -f /etc/appbox_callback_pending
+fi
+
+exec sleep infinity

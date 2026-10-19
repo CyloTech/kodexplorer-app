@@ -5,3 +5,5 @@
 !scripts/30_installer.sh
 !scripts/kodbox-install-step.php
 !scripts/kodbox-install-check.php
+!scripts/appbox-installed-callback
+!scripts/appbox-callback-run
