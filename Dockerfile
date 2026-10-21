@@ -17,9 +17,11 @@
 # pinned here. release/verify-image.sh checks that the result sits on exactly
 # that image's 25 layers.
 #
-# The only other change is scripts/kod.sh: on a recreated container it keeps
-# the KODExplorer 4.x code already in public_html instead of resetting it to
-# the 4.40 code in Git (15 instances run 4.51 to 4.56 from the in-app updater).
+# Two scripts change. scripts/kod.sh keeps the KODExplorer 4.x code already in
+# public_html (15 instances run 4.51 to 4.56 from the in-app updater) and the
+# admin account on a recreated container, instead of resetting them to the
+# 4.40 code in Git. scripts/05_run_php.sh recreates /run/php on every start,
+# because the platform mounts a tmpfs on /run in new containers.
 
 ARG PHP72_SOURCE_VERSION=7.2.24-0ubuntu0.18.04.17
 ARG PHP72_LOCAL_SUFFIX=+cylo2
@@ -81,6 +83,7 @@ RUN set -eu; \
     php-fpm7.2 -t
 
 COPY --chmod=0755 scripts/kod.sh /scripts/install/kod.sh
+COPY --chmod=0755 scripts/05_run_php.sh /etc/my_init.d/05_run_php.sh
 
 LABEL net.cylo.php72-version="${PHP72_SOURCE_VERSION}${PHP72_LOCAL_SUFFIX}" \
       net.cylo.base-image="${KODEXPLORER_BASE}"

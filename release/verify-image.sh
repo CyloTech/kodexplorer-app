@@ -23,6 +23,8 @@ EXPECTED_PHP72_VERSION=7.2.24-0ubuntu0.18.04.17+cylo2
 DEPLOYED_KOD_SH_SHA256=baff9ba9e5a53a1051e33adffb542d2a079b7d7971927caf89e2b6c4126e41b5
 KOD_SH_SHA256=250464b2255d96eb2df141013a93ed7903727d4b135f04f77100a3e93f4ce3c1
 INSTALLER_SHA256=174bd8710ee1ee786cc27d8f1ee48fac7852f241e971c50b85a55a7ebf2244c9
+# /etc/my_init.d/05_run_php.sh: recreates /run/php on every start.
+RUN_PHP_SHA256=dea866e172ec3700f357dffbec758222e597885830cb8d4a2340c7fd03d039a5
 # How long the first-boot installers may take in the runtime checks.
 RUNTIME_TIMEOUT=${RUNTIME_TIMEOUT:-900}
 
@@ -161,9 +163,22 @@ if [ -n "$base_ref" ] && [ "$(docker run --rm --network none --entrypoint sha256
 else
     fail "the base image's kod.sh is not the deployed file"
 fi
-for perm in "$(docker run --rm --network none --entrypoint stat "$image_ref" -c '%a %U:%G' /scripts/install/kod.sh)"; do
-    if [ "$perm" = "755 root:root" ]; then pass "kod.sh mode $perm"; else fail "kod.sh mode $perm, expected 755 root:root"; fi
+for f in /scripts/install/kod.sh /etc/my_init.d/05_run_php.sh; do
+    perm=$(docker run --rm --network none --entrypoint stat "$image_ref" -c '%a %U:%G' "$f")
+    if [ "$perm" = "755 root:root" ]; then pass "$f mode $perm"; else fail "$f mode $perm, expected 755 root:root"; fi
 done
+if in_image_sh -c "printf '%s  %s\n' $RUN_PHP_SHA256 /etc/my_init.d/05_run_php.sh | sha256sum -c -"; then
+    pass "05_run_php.sh is the gated file"
+else
+    fail "05_run_php.sh is not the expected file"
+fi
+expected_init=$({ docker run --rm --network none --entrypoint ls "$base_ref" /etc/my_init.d; echo 05_run_php.sh; } | LC_ALL=C sort | tr '\n' ' ')
+image_init=$(in_image ls /etc/my_init.d | LC_ALL=C sort | tr '\n' ' ')
+if [ "$image_init" = "$expected_init" ]; then
+    pass "my_init.d is the deployed set plus 05_run_php.sh ($image_init)"
+else
+    fail "my_init.d is '$image_init', expected '$expected_init'"
+fi
 if [ -z "$(in_image_sh -c 'apt-get -s autoremove 2>/dev/null | grep "^Remv" || true')" ]; then
     pass "the first-boot apt autoremove removes nothing"
 else
@@ -205,8 +220,16 @@ rt_cleanup() {
 }
 trap 'rt_cleanup; rm -f "${registry_body:-}"' EXIT
 rt_start() {
-    # rt_start <name> <image> <volume set> <network>
-    docker run -d --name "$1" --init --network "$4" \
+    # rt_start <name> <image> <volume set> <network> [platform]
+    # "platform" adds the tmpfs mounts the platform gives every container it
+    # creates today (/run, /tmp, /var/tmp); the deployed customer containers
+    # predate them, so the deployed image runs without.
+    tmpfs_args=
+    if [ "${5:-}" = platform ]; then
+        tmpfs_args="--tmpfs /run:rw,exec,mode=1777 --tmpfs /tmp:rw,exec,mode=1777 --tmpfs /var/tmp:rw,exec,mode=1777"
+    fi
+    # shellcheck disable=SC2086
+    docker run -d --name "$1" --init --network "$4" $tmpfs_args \
         -e APEX_CALLBACK=false -e ADMIN_PASS="$admin_pass" \
         --mount "type=volume,src=$rt-$3-pub,dst=/home/appbox/public_html" \
         --mount "type=volume,src=$rt-$3-data,dst=/home/appbox/data" \
@@ -296,6 +319,31 @@ rt_checks() {
         pass "$2: no PHP fatal errors in the container log"
     fi
 }
+rt_restart_check() {
+    # rt_restart_check <name> <label>: after a restart (fresh tmpfs /run)
+    # php-fpm must come back and serve PHP through nginx.
+    docker restart -t 30 "$1" >/dev/null
+    if rt_wait "$1"; then
+        pass "$2: the container restarted and nginx answers"
+    else
+        fail "$2: the container did not come back after a restart"
+        return 0
+    fi
+    waited=0
+    until docker exec "$1" sh -c 'ps -eo args | grep -q "^php-fpm: master"' 2>/dev/null; do
+        waited=$((waited + 2))
+        [ "$waited" -le 60 ] || break
+        sleep 2
+    done
+    printf '%s' '<?php echo PHP_SAPI, " ", PHP_VERSION;' | docker exec -i "$1" sh -c 'cat > /home/appbox/public_html/gate-probe.php'
+    probe=$(docker exec "$1" curl -s -m 30 http://localhost/gate-probe.php)
+    docker exec "$1" rm -f /home/appbox/public_html/gate-probe.php
+    if [ "$probe" = "fpm-fcgi $EXPECTED_PHP72_VERSION" ]; then
+        pass "$2: after a restart php-fpm serves PHP again"
+    else
+        fail "$2: after a restart PHP is not served ('$probe'): $(docker logs --tail 5 "$1" 2>&1 | tr '\n' ' ' | head -c 300)"
+    fi
+}
 
 if [ -n "$base_ref" ] && rt_start "$rt-base" "$base_ref" upd bridge && rt_wait "$rt-base"; then
     pass "the deployed image installed KODExplorer"
@@ -313,7 +361,7 @@ if [ -n "$base_ref" ] && rt_start "$rt-base" "$base_ref" upd bridge && rt_wait "
     before=$(docker exec "$rt-base" sh -c 'cd /home/appbox && sha256sum public_html/config/version.php public_html/config/config.php public_html/config/define.php public_html/index.php public_html/gate-marker.txt data/User/admin/home/gate/file.txt data/system/system_member.php | sort')
     users_before=$(docker exec "$rt-base" ls /home/appbox/data/User)
     docker stop -t 30 "$rt-base" >/dev/null && docker rm "$rt-base" >/dev/null
-    if rt_start "$rt-upd" "$image_ref" upd none && rt_wait "$rt-upd"; then
+    if rt_start "$rt-upd" "$image_ref" upd none platform && rt_wait "$rt-upd"; then
         pass "update: the candidate started on the deployed image's volumes without a network"
         docker logs "$rt-upd" 2>&1 | grep -F 'Keeping the installed KODExplorer' | sed 's/^/  | /'
         after=$(docker exec "$rt-upd" sh -c 'cd /home/appbox && sha256sum public_html/config/version.php public_html/config/config.php public_html/config/define.php public_html/index.php public_html/gate-marker.txt data/User/admin/home/gate/file.txt data/system/system_member.php | sort')
@@ -332,6 +380,7 @@ if [ -n "$base_ref" ] && rt_start "$rt-base" "$base_ref" upd bridge && rt_wait "
             fail "update: the user directories changed"
         fi
         rt_checks "$rt-upd" update
+        rt_restart_check "$rt-upd" "update"
     else
         fail "update: the candidate did not finish its installer"
     fi
@@ -339,7 +388,7 @@ else
     fail "the deployed image did not install KODExplorer"
 fi
 
-if rt_start "$rt-new" "$image_ref" new bridge && rt_wait "$rt-new"; then
+if rt_start "$rt-new" "$image_ref" new bridge platform && rt_wait "$rt-new"; then
     pass "fresh install: the candidate installed KODExplorer"
     new_version=$(docker exec "$rt-new" grep -o "KOD_VERSION','[0-9.]*" /home/appbox/public_html/config/version.php)
     if [ "$new_version" = "KOD_VERSION','4.40" ]; then
@@ -348,6 +397,7 @@ if rt_start "$rt-new" "$image_ref" new bridge && rt_wait "$rt-new"; then
         fail "fresh install: unexpected KODExplorer version '$new_version'"
     fi
     rt_checks "$rt-new" "fresh install"
+    rt_restart_check "$rt-new" "fresh install"
 else
     fail "fresh install: the candidate did not finish its installer"
 fi
