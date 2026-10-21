@@ -13,9 +13,12 @@ fi
 
 # A recreated container (app update) keeps the KODExplorer 4.x code that is
 # already installed, including versions the in-app updater installed, instead
-# of resetting it to the 4.40 code in the Git repository. Fresh installs and
-# volumes holding anything else are installed from Git as before.
+# of resetting it to the 4.40 code in the Git repository, and keeps the admin
+# account when install.lock exists. Fresh installs and volumes holding
+# anything else are installed from Git as before.
+KOD_KEEP_INSTALL=0
 if grep -Eqs "KOD_VERSION['\"] *, *['\"]4\." /home/appbox/public_html/config/version.php; then
+    KOD_KEEP_INSTALL=1
     echo "Keeping the installed KODExplorer: $(grep -E "KOD_VERSION['\"] *," /home/appbox/public_html/config/version.php)"
 else
 
@@ -60,7 +63,7 @@ if [ -L "/home/appbox/data/User/admin/home/appbox_apps" ]; then
     rm /home/appbox/data/User/admin/home/appbox_apps
 fi
 
-if [ -f "/home/appbox/data/system/install.lock" ]; then
+if [ -f "/home/appbox/data/system/install.lock" ] && [ "$KOD_KEEP_INSTALL" != 1 ]; then
     rm /home/appbox/data/system/install.lock
 fi
 

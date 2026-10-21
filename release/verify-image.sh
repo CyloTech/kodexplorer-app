@@ -18,9 +18,10 @@ set -eu
 EXPECTED_PHP72_VERSION=7.2.24-0ubuntu0.18.04.17+cylo2
 # Install scripts. 30_installer.sh is the deployed 4.35-6 file; kod.sh is the
 # deployed file (DEPLOYED_KOD_SH_SHA256) plus the guard that keeps installed
-# KODExplorer 4.x code on a recreated container (scripts/kod.sh).
+# KODExplorer 4.x code and the admin account on a recreated container
+# (scripts/kod.sh).
 DEPLOYED_KOD_SH_SHA256=baff9ba9e5a53a1051e33adffb542d2a079b7d7971927caf89e2b6c4126e41b5
-KOD_SH_SHA256=371259fcf11521b1d5d0536b07da01ff2436dc7a5bde27a798be50d84082c533
+KOD_SH_SHA256=250464b2255d96eb2df141013a93ed7903727d4b135f04f77100a3e93f4ce3c1
 INSTALLER_SHA256=174bd8710ee1ee786cc27d8f1ee48fac7852f241e971c50b85a55a7ebf2244c9
 # How long the first-boot installers may take in the runtime checks.
 RUNTIME_TIMEOUT=${RUNTIME_TIMEOUT:-900}
@@ -308,10 +309,10 @@ if [ -n "$base_ref" ] && rt_start "$rt-base" "$base_ref" upd bridge && rt_wait "
         pass "update: the candidate started on the deployed image's volumes without a network"
         docker logs "$rt-upd" 2>&1 | grep -F 'Keeping the installed KODExplorer' | sed 's/^/  | /'
         after=$(docker exec "$rt-upd" sh -c 'cd /home/appbox && sha256sum public_html/config/version.php public_html/config/config.php public_html/config/define.php public_html/index.php public_html/gate-marker.txt data/User/admin/home/gate/file.txt data/system/system_member.php | sort')
-        # loginFirst rewrites system_member.php (admin password reset to
-        # ADMIN_PASS, as the deployed kod.sh does); everything else must match.
-        if [ "$(echo "$before" | grep -v system_member)" = "$(echo "$after" | grep -v system_member)" ]; then
-            pass "update: the installed code (KOD 4.52 marker), config and user files are unchanged"
+        # The guarded kod.sh keeps install.lock, so the admin account
+        # (system_member.php) must be unchanged too.
+        if [ "$before" = "$after" ]; then
+            pass "update: the installed code (KOD 4.52 marker), config, accounts and user files are unchanged"
         else
             fail "update: code, config or user files changed"
             echo "$before" | sed 's/^/  before /'
