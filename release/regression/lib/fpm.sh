@@ -53,7 +53,10 @@ fpm_start() {
     printf '%s' '<?php echo getmypid();' > "$fpm_root/pid.php"
     chmod -R a+rX "$fpm_root"
 
-    php-fpm7.2 --nodaemonize --fpm-config "$fpm_dir/fpm.conf" >"$fpm_dir/master.out" 2>&1 &
+    # zend.assertions=1 at startup, whatever php.ini says: Ubuntu's production
+    # php.ini (used by this image's FPM) sets -1, and the CVE-2026-109619
+    # check needs PHP_VALUE=zend.assertions=-1 to warn before request startup.
+    php-fpm7.2 -d zend.assertions=1 --nodaemonize --fpm-config "$fpm_dir/fpm.conf" >"$fpm_dir/master.out" 2>&1 &
     fpm_master=$!
     trap 'fpm_stop' EXIT
 

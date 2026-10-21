@@ -250,10 +250,17 @@ rt_checks() {
         *) pass "$2: the installer page is not served" ;;
     esac
     login=$(rt_get "$1" "index.php?user/loginSubmit&isAjax=1&name=admin&password=$admin_pass")
-    case "$login" in
-        *'"code":true'*) pass "$2: admin can log in" ;;
-        *) fail "$2: admin login failed: $(printf '%s' "$login" | head -c 300)" ;;
-    esac
+    if printf '%s' "$login" | grep -Eq '"code": *true'; then
+        pass "$2: admin can log in"
+    else
+        fail "$2: admin login failed: $(printf '%s' "$login" | head -c 300)"
+    fi
+    bad_login=$(rt_get "$1" "index.php?user/loginSubmit&isAjax=1&name=admin&password=not-$admin_pass")
+    if printf '%s' "$bad_login" | grep -Eq '"code": *false'; then
+        pass "$2: a wrong admin password is rejected"
+    else
+        fail "$2: a wrong admin password was not rejected: $(printf '%s' "$bad_login" | head -c 300)"
+    fi
     if docker exec "$1" test -f /home/appbox/data/system/install.lock; then
         pass "$2: install.lock exists"
     else
@@ -293,10 +300,11 @@ rt_checks() {
 if [ -n "$base_ref" ] && rt_start "$rt-base" "$base_ref" upd bridge && rt_wait "$rt-base"; then
     pass "the deployed image installed KODExplorer"
     base_login=$(rt_get "$rt-base" "index.php?user/loginSubmit&isAjax=1&name=admin&password=$admin_pass")
-    case "$base_login" in
-        *'"code":true'*) pass "deployed image: admin can log in" ;;
-        *) fail "deployed image: admin login failed: $(printf '%s' "$base_login" | head -c 300)" ;;
-    esac
+    if printf '%s' "$base_login" | grep -Eq '"code": *true'; then
+        pass "deployed image: admin can log in"
+    else
+        fail "deployed image: admin login failed: $(printf '%s' "$base_login" | head -c 300)"
+    fi
     # Make the volume look like an instance the in-app updater moved to 4.52,
     # with a user file, a code marker and a customised file.
     docker exec "$rt-base" sh -c "sed -i \"s/define('KOD_VERSION','4.40')/define('KOD_VERSION','4.52')/\" /home/appbox/public_html/config/version.php \
