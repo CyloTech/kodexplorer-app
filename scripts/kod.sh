@@ -1,57 +1,76 @@
 #!/bin/bash
 set -x
 
-/bin/sh /scripts/Entrypoint.sh &
-sleep 5
+    
+# Start Nginx
+/usr/sbin/php-fpm7.2 --fpm-config /home/appbox/config/php-fpm/php-fpm.conf &
 
-if [ ! -f /etc/ke_installed ]; then
+/usr/sbin/nginx -c /home/appbox/config/nginx/nginx.conf &
 
-    # Start Nginx
-#    /usr/sbin/php-fpm7.2 --fpm-config /home/appbox/config/php-fpm/php-fpm.conf &
-#    /usr/sbin/nginx -c /home/appbox/config/nginx/nginx.conf &
-
-    echo "Waiting for webserver to come up".
-    until $(curl --output /dev/null --silent --head --fail ${HTTP_DOMAIN}); do
-        printf '.'
-        sleep 1
-    done
-
-    rm -fr /home/appbox/config/nginx/sites-enabled/default-site.conf
-    mv /nginx-site.conf /home/appbox/config/nginx/sites-enabled/default-site.conf
-
-    if [ ! -d "/home/appbox/public_html/KODExplorer" ]; then
-        cd /home/appbox/public_html
-        git clone https://github.com/kalcaddle/KODExplorer.git
-    else
-        cd /home/appbox/public_html/KODExplorer
-        git pull
-    fi
-
-    chown -R appbox:appbox /home/appbox/public_html/KODExplorer/
-    chmod -R 777 /home/appbox/public_html/KODExplorer
-
-    pkill -9 nginx
-
-    echo "Waiting for webserver to come up again".
-    until $(curl --output /dev/null --silent --head --fail ${HTTP_DOMAIN}); do
-        printf '.'
-        sleep 1
-    done
-
-    curl "${HTTP_DOMAIN}/index.php"
-    curl "${HTTP_DOMAIN}/index.php?user/loginFirst&password=${ADMIN_PASS}"
-
-    ln -s /var/www/apps /home/appbox/public_html/KODExplorer/data/User/admin/home/appbox_apps
-    ln -s /var/www/storage /home/appbox/public_html/KODExplorer/data/User/admin/home/appbox_storage
-
-    # Disable Guest & Demo Logins
-    rm -fr /home/appbox/public_html/KODExplorer/data/User/guest
-    rm -fr /home/appbox/public_html/KODExplorer/data/User/demo
-
-    curl -i -H "Accept: application/json" -H "Content-Type:application/json" -X POST "https://api.cylo.io/v1/apps/installed/$INSTANCE_ID"
-    touch /etc/ke_installed
+if [ -d "/home/appbox/public_html/KODExplorer" ]; then
+    rm -rf /home/appbox/public_html/KODExplorer
 fi
 
-tail -f /etc/resolv.conf
-# Start supervisord and services
-# exec /usr/bin/supervisord -n -c /home/appbox/config/supervisor/supervisord.conf
+if [ ! -f "/home/appbox/public_html/index.php" ]; then
+    git clone https://github.com/Rid/KODExplorer /home/appbox/public_html
+else
+    rm -rf /home/appbox/public_html/.*
+    rm -rf /home/appbox/public_html/*
+    git clone https://github.com/Rid/KODExplorer /home/appbox/public_html
+fi
+
+sed -i "s@BASIC_PATH .'data/@'/home/appbox/data/@g" /home/appbox/public_html/config/config.php
+sed -i "s@/opt/kodexplorer-data/@/home/appbox/data/@g" /home/appbox/public_html/config/define.php
+
+# Fix stupid permissions
+sed -i "s@0640@0755@g" /home/appbox/public_html/config/config.php
+sed -i "s@0750@0755@g" /home/appbox/public_html/config/config.php
+
+if [ ! -d "/home/appbox/data/User" ]; then
+    mv /home/appbox/public_html/data/* /home/appbox/data/
+fi
+
+if [ ! -d "/home/appbox/data/User/admin/data" ]; then
+    mkdir -p /home/appbox/data/User/admin/data
+fi
+
+mkdir -p /home/appbox/data/User/admin/home/desktop/
+echo '{"type":"app_link","content":"ui.path.list(hashDecode('\''L3Zhci93d3cvc3RvcmFnZS8_c'\''));","icon":"folder"}' > /home/appbox/data/User/admin/home/desktop/appbox_storage.oexe
+echo '{"type":"app_link","content":"ui.path.list(hashDecode('\''L3Zhci93d3cvYXBwcy8_c'\''));","icon":"folder"}' > /home/appbox/data/User/admin/home/desktop/appbox_apps.oexe
+
+if [ -L "/home/appbox/data/User/admin/home/appbox_storage/storage" ]; then
+    rm /home/appbox/data/User/admin/home/appbox_storage/storage
+fi
+
+if [ -L "/home/appbox/data/User/admin/home/appbox_storage" ]; then
+    rm /home/appbox/data/User/admin/home/appbox_storage
+fi
+
+if [ -L "/home/appbox/data/User/admin/home/appbox_apps" ]; then
+    rm /home/appbox/data/User/admin/home/appbox_apps
+fi
+
+if [ -f "/home/appbox/data/system/install.lock" ]; then
+    rm /home/appbox/data/system/install.lock
+fi
+
+chmod -R 777 /home/appbox/data
+chmod -R 777 /home/appbox/public_html
+
+chown -R appbox:appbox /home/appbox/
+
+echo "Waiting for webserver to come up".
+until $(curl --output /dev/null --silent --head --fail ${HTTP_DOMAIN}); do
+    printf '.'
+    sleep 1
+done
+
+curl "${HTTP_DOMAIN}/index.php?user/loginFirst&password=${ADMIN_PASS}"
+
+kill $(ps aux | grep '[n]ginx' | awk '{print $2}')
+kill $(ps aux | grep '[p]hp' | awk '{print $2}')
+
+# Disable Guest & Demo Logins
+rm -fr /home/appbox/data/User/guest
+rm -fr /home/appbox/data/User/demo
+
