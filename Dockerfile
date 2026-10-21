@@ -12,7 +12,7 @@
 # release/verify-image.sh fails unless the installed version is newer than
 # the last build published before the disclosure (8.3.6-0ubuntu0.24.04.12).
 
-ARG PHP83_MIN_VERSION=8.3.6-0ubuntu0.24.04.12
+ARG PHP83_MIN_VERSION=8.3.6-0ubuntu0.24.04.13
 
 FROM repo.cylo.net/kodbox@sha256:7e65783582d949e0cb8d197eb09736fb4d50e8a8eda94ff0200ceb5211925ae4
 ARG PHP83_MIN_VERSION
