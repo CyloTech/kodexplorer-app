@@ -11,6 +11,14 @@ if [ -d "/home/appbox/public_html/KODExplorer" ]; then
     rm -rf /home/appbox/public_html/KODExplorer
 fi
 
+# A recreated container (app update) keeps the KODExplorer 4.x code that is
+# already installed, including versions the in-app updater installed, instead
+# of resetting it to the 4.40 code in the Git repository. Fresh installs and
+# volumes holding anything else are installed from Git as before.
+if grep -Eqs "KOD_VERSION['\"] *, *['\"]4\." /home/appbox/public_html/config/version.php; then
+    echo "Keeping the installed KODExplorer: $(grep -E "KOD_VERSION['\"] *," /home/appbox/public_html/config/version.php)"
+else
+
 if [ ! -f "/home/appbox/public_html/index.php" ]; then
     git clone https://github.com/Rid/KODExplorer /home/appbox/public_html
 else
@@ -25,6 +33,8 @@ sed -i "s@/opt/kodexplorer-data/@/home/appbox/data/@g" /home/appbox/public_html/
 # Fix stupid permissions
 sed -i "s@0640@0755@g" /home/appbox/public_html/config/config.php
 sed -i "s@0750@0755@g" /home/appbox/public_html/config/config.php
+
+fi
 
 if [ ! -d "/home/appbox/data/User" ]; then
     mv /home/appbox/public_html/data/* /home/appbox/data/

@@ -3,22 +3,27 @@
 #
 # Stage 1 rebuilds Ubuntu's last public bionic php7.2 source package with the
 # patches in php72-patches/. It is byte-for-byte the php72-build stage of
-# CyloTech/rutorrent-app (branch php72-multipart-fix), and php72-patches/
-# must stay identical to rutorrent-app's, so both images carry the same PHP
-# build. Stage 2 is the deployed 4.35-6 image with only its php7.2 packages
-# replaced, so the PHP ABI, the PECL extensions, the configuration and the
-# install scripts (kod.sh, 30_installer.sh) stay as they were.
+# CyloTech/rutorrent-app (branch php72-multipart-fix, e5de63e2), and
+# php72-patches/ must stay identical to rutorrent-app's, so both images carry
+# the same PHP build. Stage 2 is the deployed 4.35-6 image with its php7.2
+# packages replaced, so the PHP ABI, the PECL extensions, the configuration
+# and 30_installer.sh stay as they were.
 #
 # KODEXPLORER_BASE is the deployed image (image ID
-# sha256:683ec9821a2ffa98373fc52389fde1402714f9f3a369c1e1a684c31cf91027c8),
-# which is no longer in the registry under any tag. Re-publish it as
-# repo.cylo.net/kodexplorer:4.35-6-bionic-base and pin it here by digest
-# before the release build. release/verify-image.sh checks that the result
-# sits on exactly that image's 25 layers, whatever the reference.
+# sha256:683ec9821a2ffa98373fc52389fde1402714f9f3a369c1e1a684c31cf91027c8).
+# It was no longer in the registry under any tag, so it was saved from a node
+# (Cylo 7050 on cylo08), checked with release/verify-base.sh and re-published
+# as repo.cylo.net/kodexplorer:4.35-6-bionic-base, whose manifest digest is
+# pinned here. release/verify-image.sh checks that the result sits on exactly
+# that image's 25 layers.
+#
+# The only other change is scripts/kod.sh: on a recreated container it keeps
+# the KODExplorer 4.x code already in public_html instead of resetting it to
+# the 4.40 code in Git (15 instances run 4.51 to 4.56 from the in-app updater).
 
 ARG PHP72_SOURCE_VERSION=7.2.24-0ubuntu0.18.04.17
-ARG PHP72_LOCAL_SUFFIX=+cylo1
-ARG KODEXPLORER_BASE=repo.cylo.net/kodexplorer:4.35-6-bionic-base
+ARG PHP72_LOCAL_SUFFIX=+cylo2
+ARG KODEXPLORER_BASE=repo.cylo.net/kodexplorer@sha256:5bd139e6840bcf3db09c27a11a6deae1db15398d90d25ae9e9c4c6ec59eac7af
 
 FROM ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98 AS php72-build
 ARG PHP72_SOURCE_VERSION
@@ -74,6 +79,8 @@ RUN set -eu; \
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold $debs; \
     rm -rf /tmp/php72 /var/lib/apt/lists/*; \
     php-fpm7.2 -t
+
+COPY --chmod=0755 scripts/kod.sh /scripts/install/kod.sh
 
 LABEL net.cylo.php72-version="${PHP72_SOURCE_VERSION}${PHP72_LOCAL_SUFFIX}" \
       net.cylo.base-image="${KODEXPLORER_BASE}"

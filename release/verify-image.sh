@@ -13,10 +13,17 @@
 # and the registry check looks that tag up instead of the image reference.
 set -eu
 
-# Install scripts of the deployed 4.35-6 image; this release must not change
-# them.
-KOD_SH_SHA256=baff9ba9e5a53a1051e33adffb542d2a079b7d7971927caf89e2b6c4126e41b5
+# The exact php7.2 build this release ships (Ubuntu's last public bionic
+# source plus php72-patches/, local suffix +cylo2).
+EXPECTED_PHP72_VERSION=7.2.24-0ubuntu0.18.04.17+cylo2
+# Install scripts. 30_installer.sh is the deployed 4.35-6 file; kod.sh is the
+# deployed file (DEPLOYED_KOD_SH_SHA256) plus the guard that keeps installed
+# KODExplorer 4.x code on a recreated container (scripts/kod.sh).
+DEPLOYED_KOD_SH_SHA256=baff9ba9e5a53a1051e33adffb542d2a079b7d7971927caf89e2b6c4126e41b5
+KOD_SH_SHA256=371259fcf11521b1d5d0536b07da01ff2436dc7a5bde27a798be50d84082c533
 INSTALLER_SHA256=174bd8710ee1ee786cc27d8f1ee48fac7852f241e971c50b85a55a7ebf2244c9
+# How long the first-boot installers may take in the runtime checks.
+RUNTIME_TIMEOUT=${RUNTIME_TIMEOUT:-900}
 
 failures=0
 pass() { echo "PASS: $*"; }
@@ -60,10 +67,11 @@ fi
 echo "== PHP packages"
 expected_version=$(docker image inspect --format '{{index .Config.Labels "net.cylo.php72-version"}}' "$image_ref")
 echo "expected php7.2 version: ${expected_version:-<missing label>}"
-case "$expected_version" in
-    *+cylo*) ;;
-    *) fail "net.cylo.php72-version label is missing or not a local build: '$expected_version'" ;;
-esac
+if [ "$expected_version" = "$EXPECTED_PHP72_VERSION" ]; then
+    pass "net.cylo.php72-version is $EXPECTED_PHP72_VERSION"
+else
+    fail "net.cylo.php72-version is '$expected_version', expected $EXPECTED_PHP72_VERSION"
+fi
 packages=$(docker run --rm --network none --entrypoint dpkg-query "$image_ref" \
     -W -f='${db:Status-Abbrev}|${Package}|${Source}|${Version}\n' \
     | awk -F'|' '{ split($3, src, " "); if (src[1] == "") src[1] = $2 } $1 ~ /^ii/ && src[1] == "php7.2" {print $2, $4}' | sort)
@@ -85,17 +93,32 @@ fi
 fpm_version=$(in_image php-fpm7.2 -v | head -1)
 echo "$fpm_version"
 case "$fpm_version" in
-    *+cylo*) pass "php-fpm7.2 is the local rebuild" ;;
-    *) fail "php-fpm7.2 is not the local rebuild" ;;
+    "PHP 7.2.24-0ubuntu0.18.04.17+cylo2 "*) pass "php-fpm7.2 -v reports 7.2.24-0ubuntu0.18.04.17+cylo2" ;;
+    *) fail "php-fpm7.2 is not the +cylo2 rebuild" ;;
 esac
+if [ -n "$packages" ]; then
+    echo "$packages" | sed 's/^/installed: /'
+fi
 echo "-- php7.2-common changelog, latest entry"
 in_image_sh -c 'zcat /usr/share/doc/php7.2-common/changelog.Debian.gz | sed -n "1,/^ --/p"' || true
 
-echo "== FPM modules"
+echo "== FPM and CLI modules"
 if in_image php-fpm7.2 -m | diff -u "$release_dir/expected-fpm-modules.txt" -; then
-    pass "FPM module list matches the deployed image"
+    pass "FPM module list matches the recorded deployed list"
 else
-    fail "FPM module list differs from the deployed image"
+    fail "FPM module list differs from the recorded deployed list"
+fi
+base_ref_for_modules=$(docker image inspect --format '{{index .Config.Labels "net.cylo.base-image"}}' "$image_ref")
+if [ -n "$base_ref_for_modules" ] && { docker image inspect "$base_ref_for_modules" >/dev/null 2>&1 || docker pull -q "$base_ref_for_modules" >/dev/null; }; then
+    for sapi in php-fpm7.2 php7.2; do
+        if [ "$(docker run --rm --network none --entrypoint "$sapi" "$base_ref_for_modules" -m)" = "$(in_image "$sapi" -m)" ]; then
+            pass "$sapi -m is identical to the deployed base image"
+        else
+            fail "$sapi -m differs from the deployed base image"
+        fi
+    done
+else
+    fail "cannot load the base image '$base_ref_for_modules' to compare modules"
 fi
 
 echo "== FPM configuration"
@@ -123,10 +146,23 @@ else
     fail "image configuration differs from the base image '$base_ref'"
 fi
 if in_image_sh -c "printf '%s  %s\n%s  %s\n' $KOD_SH_SHA256 /scripts/install/kod.sh $INSTALLER_SHA256 /etc/my_init.d/30_installer.sh | sha256sum -c -"; then
-    pass "kod.sh and 30_installer.sh are unchanged"
+    pass "kod.sh is the guarded script and 30_installer.sh is unchanged"
 else
-    fail "kod.sh or 30_installer.sh differs from the deployed image"
+    fail "kod.sh or 30_installer.sh is not the expected file"
 fi
+if [ "$(sha256sum < "$context_dir/scripts/kod.sh" | cut -d' ' -f1)" = "$KOD_SH_SHA256" ]; then
+    pass "scripts/kod.sh in the build context is the gated file"
+else
+    fail "scripts/kod.sh in the build context does not match KOD_SH_SHA256"
+fi
+if [ -n "$base_ref" ] && [ "$(docker run --rm --network none --entrypoint sha256sum "$base_ref" /scripts/install/kod.sh | cut -d' ' -f1)" = "$DEPLOYED_KOD_SH_SHA256" ]; then
+    pass "the base image has the deployed kod.sh"
+else
+    fail "the base image's kod.sh is not the deployed file"
+fi
+for perm in "$(docker run --rm --network none --entrypoint stat "$image_ref" -c '%a %U:%G' /scripts/install/kod.sh)"; do
+    if [ "$perm" = "755 root:root" ]; then pass "kod.sh mode $perm"; else fail "kod.sh mode $perm, expected 755 root:root"; fi
+done
 if [ -z "$(in_image_sh -c 'apt-get -s autoremove 2>/dev/null | grep "^Remv" || true')" ]; then
     pass "the first-boot apt autoremove removes nothing"
 else
@@ -151,6 +187,163 @@ for check in "$release_dir"/regression/*.sh; do
     fi
 done
 
+echo "== Runtime: update from the deployed image and fresh install"
+# Run the images the way the platform runs app 103: --init, the public_html
+# and data binds, ADMIN_PASS set. APEX_CALLBACK=false keeps the installers
+# from calling the production API. The deployed image installs first (it
+# clones KODExplorer from GitHub, so it needs the network); the candidate is
+# then recreated on the same volumes without a network, like an app update,
+# and must keep the installed code, data and users and serve the login page.
+# A second volume set is a fresh install of the candidate.
+run_id=$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')
+rt="gate-kodexplorer-$run_id"
+admin_pass=$(od -An -N9 -tx1 /dev/urandom | tr -d ' \n')
+rt_cleanup() {
+    for c in "$rt-base" "$rt-upd" "$rt-new"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
+    for v in "$rt-upd-pub" "$rt-upd-data" "$rt-new-pub" "$rt-new-data"; do docker volume rm -f "$v" >/dev/null 2>&1 || true; done
+}
+trap 'rt_cleanup; rm -f "${registry_body:-}"' EXIT
+rt_start() {
+    # rt_start <name> <image> <volume set> <network>
+    docker run -d --name "$1" --init --network "$4" \
+        -e APEX_CALLBACK=false -e ADMIN_PASS="$admin_pass" \
+        --mount "type=volume,src=$rt-$3-pub,dst=/home/appbox/public_html" \
+        --mount "type=volume,src=$rt-$3-data,dst=/home/appbox/data" \
+        "$2" >/dev/null
+}
+rt_wait() {
+    # rt_wait <name>: until the KOD installer has finished
+    waited=0
+    while ! docker exec "$1" test -f /etc/installer30_completed 2>/dev/null; do
+        if [ "$(docker inspect -f '{{.State.Running}}' "$1")" != true ]; then
+            docker logs --tail 40 "$1" 2>&1 | sed 's/^/  | /'
+            return 1
+        fi
+        waited=$((waited + 3))
+        if [ "$waited" -gt "$RUNTIME_TIMEOUT" ]; then
+            docker logs --tail 40 "$1" 2>&1 | sed 's/^/  | /'
+            return 1
+        fi
+        sleep 3
+    done
+    # runit starts nginx and php-fpm once my_init has run the installers
+    waited=0
+    until docker exec "$1" curl -s -o /dev/null --fail http://localhost/ 2>/dev/null; do
+        waited=$((waited + 2))
+        [ "$waited" -le 120 ] || return 1
+        sleep 2
+    done
+}
+rt_get() {
+    docker exec "$1" curl -s -m 30 "http://localhost/$2"
+}
+rt_checks() {
+    # rt_checks <name> <label>: the checks every candidate container must pass
+    login_page=$(rt_get "$1" 'index.php?user/login')
+    case "$login_page" in
+        *'id="username"'*'id="password"'*) pass "$2: the KODExplorer login page is served" ;;
+        *) fail "$2: the login page is not served: $(printf '%s' "$login_page" | head -c 300)" ;;
+    esac
+    case "$login_page" in
+        *box-install*) fail "$2: the KODExplorer installer page is served" ;;
+        *) pass "$2: the installer page is not served" ;;
+    esac
+    login=$(rt_get "$1" "index.php?user/loginSubmit&isAjax=1&name=admin&password=$admin_pass")
+    case "$login" in
+        *'"code":true'*) pass "$2: admin can log in" ;;
+        *) fail "$2: admin login failed: $(printf '%s' "$login" | head -c 300)" ;;
+    esac
+    if docker exec "$1" test -f /home/appbox/data/system/install.lock; then
+        pass "$2: install.lock exists"
+    else
+        fail "$2: install.lock is missing"
+    fi
+    served_fpm=$(docker exec "$1" sh -c 'ps -eo args | grep "^php-fpm: master" | head -1')
+    case "$served_fpm" in
+        *php-fpm.conf*) pass "$2: php-fpm is running ($served_fpm)" ;;
+        *) fail "$2: no php-fpm master is running" ;;
+    esac
+    printf '%s' '<?php echo PHP_SAPI, " ", PHP_VERSION, " ", count($_FILES), ":", isset($_FILES["f"]) ? $_FILES["f"]["size"] : -1, ":", isset($_POST["a"]) ? $_POST["a"] : "";' \
+        | docker exec -i "$1" sh -c 'cat > /home/appbox/public_html/gate-probe.php'
+    probe=$(docker exec "$1" sh -c 'printf hello > /tmp/gate-upload.txt; curl -s -m 30 -F a=b -F f=@/tmp/gate-upload.txt http://localhost/gate-probe.php')
+    docker exec "$1" rm -f /home/appbox/public_html/gate-probe.php /tmp/gate-upload.txt
+    if [ "$probe" = "fpm-fcgi $EXPECTED_PHP72_VERSION 1:5:b" ]; then
+        pass "$2: nginx serves PHP through php-fpm $EXPECTED_PHP72_VERSION and a multipart upload is parsed"
+    else
+        fail "$2: PHP probe through nginx returned '$probe'"
+    fi
+    if docker exec "$1" nginx -t -c /home/appbox/config/nginx/nginx.conf >/dev/null 2>&1; then
+        pass "$2: nginx -t"
+    else
+        fail "$2: nginx -t failed"
+    fi
+    if docker exec "$1" php-fpm7.2 -t --fpm-config /home/appbox/config/php-fpm/php-fpm.conf >/dev/null 2>&1; then
+        pass "$2: php-fpm7.2 -t with the runtime configuration"
+    else
+        fail "$2: php-fpm7.2 -t with the runtime configuration failed"
+    fi
+    if docker logs "$1" 2>&1 | grep -E 'PHP (Fatal|Parse) error' >/dev/null; then
+        fail "$2: PHP fatal errors in the container log"
+    else
+        pass "$2: no PHP fatal errors in the container log"
+    fi
+}
+
+if [ -n "$base_ref" ] && rt_start "$rt-base" "$base_ref" upd bridge && rt_wait "$rt-base"; then
+    pass "the deployed image installed KODExplorer"
+    base_login=$(rt_get "$rt-base" "index.php?user/loginSubmit&isAjax=1&name=admin&password=$admin_pass")
+    case "$base_login" in
+        *'"code":true'*) pass "deployed image: admin can log in" ;;
+        *) fail "deployed image: admin login failed: $(printf '%s' "$base_login" | head -c 300)" ;;
+    esac
+    # Make the volume look like an instance the in-app updater moved to 4.52,
+    # with a user file, a code marker and a customised file.
+    docker exec "$rt-base" sh -c "sed -i \"s/define('KOD_VERSION','4.40')/define('KOD_VERSION','4.52')/\" /home/appbox/public_html/config/version.php \
+        && echo gate-marker > /home/appbox/public_html/gate-marker.txt \
+        && mkdir -p /home/appbox/data/User/admin/home/gate && echo user-file > /home/appbox/data/User/admin/home/gate/file.txt"
+    before=$(docker exec "$rt-base" sh -c 'cd /home/appbox && sha256sum public_html/config/version.php public_html/config/config.php public_html/config/define.php public_html/index.php public_html/gate-marker.txt data/User/admin/home/gate/file.txt data/system/system_member.php | sort')
+    users_before=$(docker exec "$rt-base" ls /home/appbox/data/User)
+    docker stop -t 30 "$rt-base" >/dev/null && docker rm "$rt-base" >/dev/null
+    if rt_start "$rt-upd" "$image_ref" upd none && rt_wait "$rt-upd"; then
+        pass "update: the candidate started on the deployed image's volumes without a network"
+        docker logs "$rt-upd" 2>&1 | grep -F 'Keeping the installed KODExplorer' | sed 's/^/  | /'
+        after=$(docker exec "$rt-upd" sh -c 'cd /home/appbox && sha256sum public_html/config/version.php public_html/config/config.php public_html/config/define.php public_html/index.php public_html/gate-marker.txt data/User/admin/home/gate/file.txt data/system/system_member.php | sort')
+        # loginFirst rewrites system_member.php (admin password reset to
+        # ADMIN_PASS, as the deployed kod.sh does); everything else must match.
+        if [ "$(echo "$before" | grep -v system_member)" = "$(echo "$after" | grep -v system_member)" ]; then
+            pass "update: the installed code (KOD 4.52 marker), config and user files are unchanged"
+        else
+            fail "update: code, config or user files changed"
+            echo "$before" | sed 's/^/  before /'
+            echo "$after" | sed 's/^/  after  /'
+        fi
+        if [ "$(docker exec "$rt-upd" ls /home/appbox/data/User)" = "$users_before" ]; then
+            pass "update: the user directories are unchanged"
+        else
+            fail "update: the user directories changed"
+        fi
+        rt_checks "$rt-upd" update
+    else
+        fail "update: the candidate did not finish its installer"
+    fi
+else
+    fail "the deployed image did not install KODExplorer"
+fi
+
+if rt_start "$rt-new" "$image_ref" new bridge && rt_wait "$rt-new"; then
+    pass "fresh install: the candidate installed KODExplorer"
+    new_version=$(docker exec "$rt-new" grep -o "KOD_VERSION','[0-9.]*" /home/appbox/public_html/config/version.php)
+    if [ "$new_version" = "KOD_VERSION','4.40" ]; then
+        pass "fresh install: KODExplorer 4.40 cloned from Git"
+    else
+        fail "fresh install: unexpected KODExplorer version '$new_version'"
+    fi
+    rt_checks "$rt-new" "fresh install"
+else
+    fail "fresh install: the candidate did not finish its installer"
+fi
+rt_cleanup
+
 echo "== Registry tag must not exist"
 registry=${registry_ref%%/*}
 repository_and_tag=${registry_ref#*/}
@@ -162,7 +355,6 @@ registry_auth=$(jq -r --arg host "$registry" '.auths[$host].auth // empty' "$HOM
 [ -n "$registry_auth" ] || die "no stored credentials for $registry"
 
 registry_body=$(mktemp)
-trap 'rm -f "$registry_body"' EXIT
 
 registry_get() {
     printf 'header = "Authorization: Basic %s"\n' "$registry_auth" \
