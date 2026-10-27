@@ -1,5 +1,7 @@
-.git
-kodbox
-scripts
-sources
-release
+# Only the install scripts go into the image; everything else comes from the
+# pinned 1.70.02-1 base.
+*
+!scripts/kod.sh
+!scripts/30_installer.sh
+!scripts/kodbox-install-step.php
+!scripts/kodbox-install-check.php
