@@ -48,7 +48,16 @@ run_install_step() {
     grep -Eq '"code": ?true' <<<"$output" && ! grep -Eq '"code": ?false' <<<"$output"
 }
 
-[[ -d /kod_sources ]] || fail "/kod_sources is missing"
+if [[ ! -d /kod_sources ]]; then
+    # kod.sh removes /kod_sources when it is done. If a start was interrupted
+    # after that but before 30_installer.sh marked itself complete, keep the
+    # finished install instead of emptying public_html.
+    if [[ -f "$public_html/index.php" && -f "$settings_file" && -f "$install_lock" ]]; then
+        echo "Kodbox was already set up by an earlier start of this container"
+        exit 0
+    fi
+    fail "/kod_sources is missing and Kodbox is not installed"
+fi
 
 if [ -d "$public_html/KODExplorer" ]; then
     rm -rf "$public_html/KODExplorer"
