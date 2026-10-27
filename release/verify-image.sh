@@ -1,40 +1,48 @@
-#!/bin/sh
-# Release gate for Kodbox 1.70.02-1: the deployed kodbox:1.70.02 image with
-# its php8.3 packages upgraded from Ubuntu noble-security.
+#!/bin/bash
+# Release gate for Kodbox 1.70.02-2: the deployed kodbox:1.70.02-1 image with
+# a first-start installer that never exposes the Kodbox web installer.
 #
 # Usage: release/verify-image.sh <registry>/<repository>:<tag>
 #
-# Every check runs and reports PASS or FAIL. The script exits 0 only when all
-# of them passed and the registry definitively reports that the tag does not
-# exist yet. Any indeterminate registry answer fails.
-#
-# Checks: every php8.3 package is at least the fixed noble build and its
-# changelog names both CVEs; only php8.3-source packages differ from the
-# deployed image; php-fpm8.3 -m and php8.3 -m are identical to the deployed
-# image; php-fpm8.3 -t, apache2ctl -t and nginx -t pass; Kodbox, the install
-# scripts and the image configuration are unchanged; a multipart upload is
-# parsed by the PHP built-in server; a fresh Kodbox install (the base
-# image's nginx/php-fpm installer plus kod.sh) serves the Kodbox page, a PHP
-# page and a parsed multipart upload through nginx and php-fpm8.3
-# (release/fpm-smoke.sh); and the tag is absent from the registry.
+# Runs on the builder, next to Docker. Every check reports PASS or FAIL; the
+# script exits 0 only when all of them passed and the authenticated registry
+# definitively reports that the tag does not exist yet. Any indeterminate
+# registry answer fails.
 #
 # A trial build is tagged under another name (local/kodbox-trial:<tag>). Set
 # VERIFY_REGISTRY_REF to the repo.cylo.net reference the release will use and
 # the registry check looks that tag up instead of the image reference.
-set -eu
+#
+# Checks:
+#   image    built on the 1.70.02-1 layers; same packages, PHP modules,
+#            /kod_sources, command and environment; the scripts are the
+#            repository's; kod.sh has no tracing and no HTTP install;
+#            tests/test-installed-callback.sh passes.
+#   fresh    new volumes, dummy ADMIN_PASS with "-", "+", "&", "%", "#", "=":
+#            install/index/save requests sent from the moment the container
+#            starts are never accepted (nothing listens during the install,
+#            Kodbox rejects them afterwards); the administrator logs in with
+#            ADMIN_PASS and not with the attacker's password; one installed
+#            callback is sent; ADMIN_PASS is not in the container log or in
+#            plain text on the volumes.
+#   restart  the same container restarts without installing again or sending
+#            another callback; the administrator still logs in.
+#   weak     an ADMIN_PASS Kodbox refuses stops the first start: the container
+#            exits, nothing is served, no callback is marked, install.lock and
+#            setting_user.php are absent, and a second start fails the same way.
+#   upgrade  1.70.02-1 installs on new volumes and gets a second user; the
+#            candidate on the same volumes, with a different ADMIN_PASS, keeps
+#            the database, both users and their passwords, does not install
+#            again and sends the installed callback.
+#
+# Containers run with --network none; each has its own mock installed-callback
+# API inside it (APPBOX_CALLBACK_BASE). Every container and volume this script
+# creates is named kodbox-gate-<run id>-* and removed on exit.
+set -u -o pipefail
 
-# The deployed 1.70.02 image this release is built FROM.
-BASE_IMAGE=repo.cylo.net/kodbox@sha256:7e65783582d949e0cb8d197eb09736fb4d50e8a8eda94ff0200ceb5211925ae4
-# Last noble php8.3 build published before the 21 October 2026 disclosure.
-# The release must carry a newer one.
-PHP83_PRE_DISCLOSURE=8.3.6-0ubuntu0.24.04.12
-# First noble php8.3 build with the fix for CVE-2026-109618 and
-# CVE-2026-109619 (noble-security, 21 October 2026). Every installed php8.3
-# package must be at least this version, whatever the build argument says.
-PHP83_FIXED=8.3.6-0ubuntu0.24.04.13
-# Install scripts of the deployed image; this release must not change them.
-KOD_SH_SHA256=402504d216ed60d2b6e01071d028c76e9dcc3e1f1b3e985301b8ee9757d89773
-INSTALLER_SHA256=60def63b03e3e99b15a8d8763cb09e3703366231b51c7a5d53700a74b0d10789
+# The deployed 1.70.02-1 image (the current default) this release is built FROM.
+BASE_IMAGE=repo.cylo.net/kodbox@sha256:8e6cd075d8e360f5b0d8832b077ee315c2fd9544fc795e7be96181c227bd16ed
+WEB_TIMEOUT=${GATE_WEB_TIMEOUT:-900}
 
 failures=0
 pass() { echo "PASS: $*"; }
@@ -54,192 +62,486 @@ case "$registry_ref" in
     *) die "registry reference must be repo.cylo.net/kodbox:<tag>: $registry_ref" ;;
 esac
 release_dir=$(cd "$(dirname "$0")" && pwd)
+repo_dir=$(dirname "$release_dir")
+
+run_id=kodbox-gate-$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
 work_dir=$(mktemp -d)
-trap 'rm -rf "$work_dir"' EXIT
+containers=()
+volumes=()
+cleanup() {
+    local name
+    for name in "${containers[@]}"; do docker rm -f "$name" >/dev/null 2>&1; done
+    for name in "${volumes[@]}"; do docker volume rm -f "$name" >/dev/null 2>&1; done
+    rm -rf "$work_dir"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 docker image inspect "$image_ref" >/dev/null 2>&1 || die "$image_ref is not a local image"
 docker image inspect "$BASE_IMAGE" >/dev/null 2>&1 || docker pull -q "$BASE_IMAGE" >/dev/null \
     || die "cannot read the base image $BASE_IMAGE"
-in_image() {
-    entrypoint=$1
-    shift
-    docker run --rm --network none --entrypoint "$entrypoint" "$image_ref" "$@"
-}
-in_image_sh() {
-    docker run --rm --network none -v "$release_dir:/release:ro" --entrypoint sh "$image_ref" "$@"
-}
 
-echo "== PHP packages"
-packages=$(docker run --rm --network none --entrypoint dpkg-query "$image_ref" \
-    -W -f='${db:Status-Abbrev}|${Package}|${source:Package}|${Version}\n' \
-    | awk -F'|' '$1 ~ /^ii/ && $3 == "php8.3" {print $2, $4}' | sort)
-echo "$packages"
-if [ -z "$packages" ]; then
-    fail "no php8.3 packages installed"
-else
-    if echo "$packages" | awk '{print $1}' | diff -u "$release_dir/expected-php83-packages.txt" -; then
-        pass "the installed php8.3 packages are the ones the deployed image has"
-    else
-        fail "the set of installed php8.3 packages differs from the deployed image"
-    fi
-    versions=$(echo "$packages" | awk '{print $2}' | sort -u)
-    if [ "$(echo "$versions" | wc -l)" -ne 1 ]; then
-        fail "php8.3 packages have mixed versions: $(echo "$versions" | tr '\n' ' ')"
-    else
-        php_version=$versions
-        min_version=$(docker image inspect --format '{{index .Config.Labels "net.cylo.php83-min-version"}}' "$image_ref")
-        if [ -z "$min_version" ]; then
-            fail "image has no net.cylo.php83-min-version label"
-        elif in_image dpkg --compare-versions "$php_version" ge "$min_version"; then
-            pass "php8.3 $php_version is at least the release pin $min_version"
-        else
-            fail "php8.3 $php_version is older than the release pin $min_version"
-        fi
-        if in_image dpkg --compare-versions "$php_version" gt "$PHP83_PRE_DISCLOSURE"; then
-            pass "php8.3 $php_version is newer than the pre-disclosure $PHP83_PRE_DISCLOSURE"
-        else
-            fail "php8.3 $php_version is not newer than $PHP83_PRE_DISCLOSURE, so it does not include the 21 October 2026 fix"
-        fi
-    fi
-    # One container compares every package; it prints "ok <package>" or
-    # "old <package> <version>" per package, so a lost answer cannot pass.
-    min_check=$(in_image_sh -c '
-        dpkg-query -W -f="\${db:Status-Abbrev}|\${Package}|\${source:Package}|\${Version}\n" \
-            | awk -F"|" "\$1 ~ /^ii/ && \$3 == \"php8.3\" {print \$2, \$4}" \
-            | while read -r pkg version; do
-                if dpkg --compare-versions "$version" ge "$1"; then
-                    echo "ok $pkg"
-                else
-                    echo "old $pkg $version"
-                fi
-            done' sh "$PHP83_FIXED") || min_check=
-    checked=$(echo "$min_check" | grep -c '^ok ' || true)
-    below_fixed=$(echo "$min_check" | sed -n 's/^old //p')
-    if [ -n "$below_fixed" ]; then
-        fail "php8.3 packages older than the fixed $PHP83_FIXED: $(echo "$below_fixed" | tr '\n' ' ')"
-    elif [ "$checked" -ne "$(echo "$packages" | wc -l)" ]; then
-        fail "could only confirm $checked php8.3 packages against $PHP83_FIXED"
-    else
-        pass "all $checked installed php8.3 packages are at least the fixed $PHP83_FIXED"
-    fi
-fi
-echo "-- php8.3-common changelog, latest entry"
-in_image_sh -c 'zcat /usr/share/doc/php8.3-common/changelog.Debian.gz | sed -n "1,/^ --/p"' || true
-if in_image_sh -c 'zcat /usr/share/doc/php8.3-common/changelog.Debian.gz | sed -n "1,/^ --/p" | grep -q "CVE-2026-109618" && zcat /usr/share/doc/php8.3-common/changelog.Debian.gz | sed -n "1,/^ --/p" | grep -q "109619"'; then
-    pass "the latest php8.3 changelog entry names CVE-2026-109618 and CVE-2026-109619"
-else
-    fail "the latest php8.3 changelog entry does not name CVE-2026-109618 and CVE-2026-109619"
-fi
+# Dummy credentials for the throwaway test containers only.
+fresh_pass='-Gate+Pw&1%2B#Q=z'
+attacker_pass='Att4ck3r!Pass'
+old_pass='OldGate1!pass'
+new_pass='NewGate2!pass'
+second_user='gateuser'
+second_pass='GateUser3!pass'
+weak_pass='password'
+callback_id=4242
+callback_query_token=gatequerytoken0123
+callback_header_token=gateheadertoken0123
 
-echo "== Packages changed from the deployed image"
-package_list() {
-    docker run --rm --network none --entrypoint dpkg-query "$1" \
-        -W -f='${db:Status-Abbrev}|${Package}:${Architecture}|${source:Package}|${Version}\n' \
-        | awk -F'|' '$1 ~ /^ii/ {print $2, $3, $4}' | sort
-}
-package_list "$BASE_IMAGE" > "$work_dir/base-packages"
-package_list "$image_ref" > "$work_dir/image-packages"
-# Lines are "<package>:<arch> <source> <version>"; a changed package shows up
-# once on each side.
-changed=$(diff "$work_dir/base-packages" "$work_dir/image-packages" | sed -n 's/^[<>] //p' \
-    | awk '{print $1, $2}' | sort -u)
-echo "$changed"
-added_or_removed=$(comm -3 "$work_dir/base-packages" "$work_dir/image-packages" | awk '{print $1}' \
-    | sort | uniq -u)
-outside_php83=$(echo "$changed" | awk 'NF && $2 != "php8.3" {print $1}')
-if [ "$(wc -l < "$work_dir/base-packages")" -lt 100 ] || [ "$(wc -l < "$work_dir/image-packages")" -lt 100 ]; then
-    fail "could not list the installed packages of both images"
-elif [ -n "$added_or_removed" ]; then
-    fail "packages were added or removed: $(echo "$added_or_removed" | tr '\n' ' ')"
-elif [ -n "$outside_php83" ]; then
-    fail "packages outside the php8.3 source changed: $(echo "$outside_php83" | tr '\n' ' ')"
-else
-    pass "only packages built from the php8.3 source changed"
-fi
+# Mock installed-callback API, run inside a test container: answers 200 and
+# appends {"path", "token"} per request to the log file.
+mock_py='
+import http.server, json, sys
+port, log = int(sys.argv[1]), sys.argv[2]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        with open(log, "a") as f:
+            f.write(json.dumps({"path": self.path, "token": self.headers.get("X-Cylo-Callback-Token", "")}) + "\n")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b"{\"success\":true}")
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+'
 
-echo "== PHP modules"
-if in_image php-fpm8.3 -m | diff -u "$release_dir/expected-fpm-modules.txt" -; then
-    pass "FPM module list matches the recorded list"
-else
-    fail "FPM module list differs from the recorded list"
-fi
-for sapi in php-fpm8.3 php8.3; do
-    docker run --rm --network none --entrypoint "$sapi" "$BASE_IMAGE" -m > "$work_dir/base-modules" \
-        || die "cannot list $sapi modules of the base image"
-    if in_image "$sapi" -m | diff -u "$work_dir/base-modules" -; then
-        pass "$sapi -m is identical to the deployed image"
-    else
-        fail "$sapi -m differs from the deployed image"
-    fi
+# Unauthenticated install requests, sent from inside a test container every
+# 0.2 s until /var/log/gate-attack.stop exists or $1 seconds have passed. One
+# line per request: "<epoch> <step> <body> HTTP<code>".
+attack_sh='
+log=/var/log/gate-attack.log
+end=$(( $(date +%s) + $1 ))
+while [ ! -f /var/log/gate-attack.stop ] && [ "$(date +%s)" -lt "$end" ]; do
+    for body in "action=db&dbType=sqlite&pdoType=sqlite&cacheType=file" "action=user&name=admin&password=$2"; do
+        out=$(curl -s -m 3 -w " HTTP%{http_code}" -X POST --data "$body" "http://127.0.0.1/?install/index/save" 2>/dev/null | tr -d "\n")
+        echo "$(date +%s) ${body%%&*} ${out:- HTTP000}" >> "$log"
+    done
+    sleep 0.2
 done
+'
 
-echo "== Configuration tests"
-if in_image php-fpm8.3 -t; then
-    pass "php-fpm8.3 -t"
-else
-    fail "php-fpm8.3 configuration test failed"
-fi
-if in_image apache2ctl -t; then
-    pass "apache2ctl -t (loads libapache2-mod-php8.3)"
-else
-    fail "apache2ctl -t failed"
-fi
-if in_image nginx -t; then
-    pass "nginx -t"
-else
-    fail "nginx -t failed"
-fi
+new_volume() {
+    docker volume create "$1" >/dev/null || die "cannot create volume $1"
+    volumes+=("$1")
+}
 
-echo "== Kodbox code and install scripts"
-if in_image_sh -c "grep -q \"define('KOD_VERSION','1.70');\" /kod_sources/config/version.php && grep -q \"define('KOD_VERSION_BUILD','02');\" /kod_sources/config/version.php"; then
-    pass "/kod_sources is Kodbox 1.70 build 02"
-else
-    fail "/kod_sources is not Kodbox 1.70 build 02"
-fi
-if in_image_sh -c "printf '%s  %s\n%s  %s\n' $KOD_SH_SHA256 /scripts/install/kod.sh $INSTALLER_SHA256 /etc/my_init.d/30_installer.sh | sha256sum -c -"; then
-    pass "kod.sh and 30_installer.sh are unchanged"
-else
-    fail "kod.sh or 30_installer.sh differs from the deployed image"
-fi
+# start_container <name> <image> <env file> <public_html volume> <data volume>
+start_container() {
+    containers+=("$1")
+    docker run -d --name "$1" --network none --env-file "$3" \
+        -v "$4:/home/appbox/public_html" -v "$5:/home/appbox/data" "$2" >/dev/null
+}
 
-echo "== Image configuration"
+# write_env <file> <ADMIN_PASS> [HTTP_DOMAIN]
+write_env() {
+    {
+        printf 'ADMIN_PASS=%s\n' "$2"
+        printf 'ADMIN_USER=admin\n'
+        printf 'HTTP_DOMAIN=%s\n' "${3:-http://kodbox.gate.invalid}"
+        printf 'INSTANCE_ID=%s?callback_token=%s\n' "$callback_id" "$callback_query_token"
+        printf 'CALLBACK_TOKEN=%s\n' "$callback_header_token"
+        printf 'APPBOX_CALLBACK_BASE=http://127.0.0.1:18080\n'
+        printf 'APPBOX_CALLBACK_RETRY_DELAY=1\n'
+    } > "$1"
+}
+
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
+
+# wait_for_web <container>: 0 once nginx serves the Kodbox page, 1 on timeout,
+# 2 if the container stopped.
+wait_for_web() {
+    local deadline=$(( $(date +%s) + WEB_TIMEOUT ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        running "$1" || return 2
+        [ "$(docker exec "$1" curl -s -o /dev/null -m 5 -w '%{http_code}' http://127.0.0.1/ 2>/dev/null)" = 200 ] && return 0
+        sleep 3
+    done
+    return 1
+}
+
+# wait_for_exit <container>: 0 once it has stopped, 1 on timeout.
+wait_for_exit() {
+    local deadline=$(( $(date +%s) + WEB_TIMEOUT ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        running "$1" || return 0
+        sleep 3
+    done
+    return 1
+}
+
+# wait_for_log <container> <fixed string>
+wait_for_log() {
+    local deadline=$(( $(date +%s) + WEB_TIMEOUT ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+        docker logs "$1" 2>&1 | grep -qF -- "$2" && return 0
+        running "$1" || return 2
+        sleep 3
+    done
+    return 1
+}
+
+start_mock() { docker exec -d "$1" python3 -c "$mock_py" 18080 /var/log/gate-callback.log; }
+callback_requests() { docker exec "$1" sh -c 'cat /var/log/gate-callback.log 2>/dev/null' | grep -c . ; }
+
+# login <container> <name> <password>: prints Kodbox's JSON answer.
+login() {
+    docker exec "$1" curl -s -m 30 --data-urlencode "name=$2" --data-urlencode "password=$3" \
+        'http://127.0.0.1/?user/index/loginSubmit'
+}
+json_ok() { grep -Eq '"code": ?true'; }
+
+# admin_snapshot <container>: settings DB file and the user rows (id, name,
+# role, status, password hash), read with sqlite3 inside the container.
+db_snapshot() {
+    docker exec "$1" sh -c '
+        db=$(sed -n "s/.*USER_SYSTEM\.'"'"'\([A-Za-z0-9]*\.php\)'"'"'.*/\1/p" /home/appbox/public_html/config/setting_user.php | head -1)
+        [ -n "$db" ] || exit 1
+        echo "db=$db"
+        sqlite3 "/home/appbox/data/system/$db" "SELECT userID, name, roleID, status, password FROM user ORDER BY userID;"
+        sqlite3 "/home/appbox/data/system/$db" "SELECT COUNT(*) FROM io_source;"'
+}
+
+logs_contain_secret() {
+    docker logs "$1" 2>&1 | grep -qF -e "$2" -e "$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$2")"
+}
+
+echo "== Image"
+image_layers=$(docker image inspect -f '{{json .RootFS.Layers}}' "$image_ref")
+base_layers=$(docker image inspect -f '{{json .RootFS.Layers}}' "$BASE_IMAGE")
+if [ -n "$base_layers" ] && [ "${image_layers#"${base_layers%]}"}" != "$image_layers" ]; then
+    pass "built on every layer of the 1.70.02-1 image"
+else
+    fail "the image does not start with the 1.70.02-1 layers"
+fi
 config_filter='{Cmd, Entrypoint, Env, User, WorkingDir, ExposedPorts, Volumes}'
 if [ "$(docker image inspect --format '{{json .Config}}' "$image_ref" | jq -cS "$config_filter")" = \
      "$(docker image inspect --format '{{json .Config}}' "$BASE_IMAGE" | jq -cS "$config_filter")" ]; then
-    pass "command, environment, user, ports and volumes match the deployed image"
+    pass "command, environment, user, ports and volumes match 1.70.02-1"
 else
-    fail "image configuration differs from the deployed image"
+    fail "image configuration differs from 1.70.02-1"
 fi
-if [ -z "$(in_image_sh -c 'apt-get -s autoremove 2>/dev/null | grep "^Remv" || true')" ]; then
-    pass "the first-boot apt autoremove removes nothing"
+# One container per image prints everything the comparisons need, in
+# sections: packages, PHP modules (FPM and CLI), a sha256 manifest of
+# /kod_sources and the sha256 and mode of each install script.
+report_sh='
+echo "@@packages"
+dpkg-query -W -f="\${db:Status-Abbrev}|\${Package}:\${Architecture}|\${Version}\n" | awk -F"|" "\$1 ~ /^ii/ {print \$2, \$3}" | sort
+echo "@@php-fpm8.3"
+php-fpm8.3 -m 2>/dev/null
+echo "@@php8.3"
+php8.3 -m 2>/dev/null
+echo "@@kod_sources"
+cd /kod_sources && find . -type f -print0 | sort -z | xargs -0 sha256sum
+echo "@@scripts"
+for f in /scripts/install/kod.sh /scripts/install/kodbox-install-step.php /scripts/install/kodbox-install-check.php \
+    /etc/my_init.d/30_installer.sh /usr/local/bin/appbox-installed-callback /etc/service/appbox-callback/run; do
+    [ -f "$f" ] && echo "$f $(sha256sum "$f" | cut -d" " -f1) $(stat -c %a "$f")"
+done
+echo "@@end"
+'
+docker run --rm --network none --entrypoint sh "$BASE_IMAGE" -c "$report_sh" > "$work_dir/base-report" \
+    || die "cannot read the 1.70.02-1 image"
+docker run --rm --network none --entrypoint sh "$image_ref" -c "$report_sh" > "$work_dir/image-report" \
+    || die "cannot read $image_ref"
+section() { awk -v s="@@$1" '$0 == s {on = 1; next} /^@@/ {on = 0} on' "$2"; }
+for part in packages php-fpm8.3 php8.3 kod_sources; do
+    section "$part" "$work_dir/base-report" > "$work_dir/base-$part"
+    section "$part" "$work_dir/image-report" > "$work_dir/image-$part"
+done
+grep -qx '@@end' "$work_dir/image-report" || fail "the image report is incomplete"
+if [ "$(wc -l < "$work_dir/base-packages")" -gt 100 ] && cmp -s "$work_dir/base-packages" "$work_dir/image-packages"; then
+    pass "installed packages are identical to 1.70.02-1 ($(wc -l < "$work_dir/image-packages"))"
 else
-    fail "apt autoremove would remove packages at first boot"
+    fail "installed packages differ from 1.70.02-1"
 fi
-
-echo "== Multipart upload (PHP built-in server)"
-if in_image_sh /release/multipart-smoke.sh; then
-    pass "multipart upload smoke test"
-else
-    fail "multipart upload smoke test failed"
-fi
-
-echo "== Kodbox install, PHP page and multipart upload through nginx and php-fpm"
-if in_image_sh /release/fpm-smoke.sh; then
-    pass "fresh Kodbox install serves pages and parses a multipart upload through php-fpm"
-else
-    fail "nginx and php-fpm smoke test failed"
-fi
-
-echo "== Regression checks"
-for check in "$release_dir"/regression/*.sh; do
-    [ -e "$check" ] || continue
-    name=$(basename "$check")
-    if in_image_sh "/release/regression/$name"; then
-        pass "regression check $name"
+for sapi in php-fpm8.3 php8.3; do
+    if [ "$(wc -l < "$work_dir/base-$sapi")" -gt 20 ] && cmp -s "$work_dir/base-$sapi" "$work_dir/image-$sapi"; then
+        pass "$sapi -m is identical to 1.70.02-1"
     else
-        fail "regression check $name failed"
+        fail "$sapi -m differs from 1.70.02-1"
     fi
 done
+if [ "$(wc -l < "$work_dir/base-kod_sources")" -gt 3000 ] \
+    && cmp -s "$work_dir/base-kod_sources" "$work_dir/image-kod_sources" \
+    && grep -q " ./config/version.php$" "$work_dir/image-kod_sources"; then
+    pass "/kod_sources (Kodbox 1.70.02, $(wc -l < "$work_dir/image-kod_sources") files) is identical to 1.70.02-1"
+else
+    fail "/kod_sources differs from 1.70.02-1"
+fi
+script_check() {
+    local repo_file=$1 image_file=$2 want_mode=$3 want_sum
+    want_sum=$(sha256sum "$repo_dir/$repo_file" | cut -d' ' -f1)
+    if section scripts "$work_dir/image-report" | grep -qx "$image_file $want_sum $want_mode"; then
+        pass "$image_file is the repository's $repo_file (mode $want_mode)"
+    else
+        fail "$image_file is not the repository's $repo_file with mode $want_mode"
+    fi
+}
+script_check scripts/kod.sh /scripts/install/kod.sh 755
+script_check scripts/kodbox-install-step.php /scripts/install/kodbox-install-step.php 644
+script_check scripts/kodbox-install-check.php /scripts/install/kodbox-install-check.php 644
+script_check scripts/30_installer.sh /etc/my_init.d/30_installer.sh 755
+script_check scripts/appbox-installed-callback /usr/local/bin/appbox-installed-callback 755
+script_check scripts/appbox-callback-run /etc/service/appbox-callback/run 755
+kod_code=$(grep -v '^[[:space:]]*#' "$repo_dir/scripts/kod.sh")
+if echo "$kod_code" | grep -Eq 'set -[a-z]*x|curl|php-fpm|nginx|HTTP_DOMAIN'; then
+    fail "kod.sh traces commands or still uses HTTP, php-fpm or nginx"
+else
+    pass "kod.sh does not trace commands and does not start php-fpm or nginx or use HTTP"
+fi
+if bash "$repo_dir/tests/test-installed-callback.sh" > "$work_dir/callback-tests" 2>&1; then
+    pass "tests/test-installed-callback.sh ($(grep -c '^ok' "$work_dir/callback-tests") checks)"
+else
+    cat "$work_dir/callback-tests" >&2
+    fail "tests/test-installed-callback.sh failed"
+fi
+
+echo "== Fresh install with install requests racing it"
+fresh=$run_id-fresh
+new_volume "$fresh-ph"
+new_volume "$fresh-data"
+write_env "$work_dir/fresh.env" "$fresh_pass"
+start_container "$fresh" "$image_ref" "$work_dir/fresh.env" "$fresh-ph" "$fresh-data" \
+    || die "cannot start $fresh"
+docker exec -d "$fresh" bash -c "$attack_sh" attack 1800 "$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$attacker_pass")"
+start_mock "$fresh"
+wait_for_web "$fresh"
+web=$?
+if [ "$web" -eq 0 ]; then
+    pass "the new container serves Kodbox after its first start"
+    sleep 5
+    docker exec "$fresh" touch /var/log/gate-attack.stop
+    sleep 2
+    docker exec "$fresh" cat /var/log/gate-attack.log > "$work_dir/attack.log"
+    attempts=$(grep -c . "$work_dir/attack.log")
+    unanswered=$(grep -c ' HTTP000$' "$work_dir/attack.log")
+    accepted=$(grep -Ec '"code": ?true' "$work_dir/attack.log")
+    rejected_db=$(grep -E ' action=db ' "$work_dir/attack.log" | grep -E ' HTTP200$' | grep -Ec '"code": ?false')
+    rejected_user=$(grep -E ' action=user ' "$work_dir/attack.log" | grep -E ' HTTP200$' | grep -Ec '"code": ?false')
+    echo "install requests: $attempts sent, $unanswered unanswered during the install, $accepted accepted," \
+        "$rejected_db database and $rejected_user administrator steps rejected afterwards"
+    sed -n '$p' "$work_dir/attack.log"
+    if [ "$accepted" -eq 0 ] && [ "$unanswered" -ge 10 ] && [ "$rejected_db" -ge 1 ] && [ "$rejected_user" -ge 1 ]; then
+        pass "no unauthenticated install/index/save request was accepted during or after the first start"
+    else
+        fail "unauthenticated install requests: $accepted accepted, $unanswered unanswered, $rejected_db/$rejected_user rejected after start"
+    fi
+    if docker exec "$fresh" sh -c 'test -f /home/appbox/data/system/install.lock && test -f /home/appbox/public_html/config/setting_user.php'; then
+        pass "install.lock and config/setting_user.php exist"
+    else
+        fail "install.lock or config/setting_user.php is missing"
+    fi
+    if docker logs "$fresh" 2>&1 | grep -q "Installing Kodbox: creating the database" \
+        && docker logs "$fresh" 2>&1 | grep -q "^Kodbox is installed$"; then
+        pass "kod.sh installed Kodbox from the command line"
+    else
+        fail "the log does not show kod.sh installing Kodbox"
+    fi
+    if logs_contain_secret "$fresh" "$fresh_pass"; then
+        fail "ADMIN_PASS appears in the container log"
+    else
+        pass "ADMIN_PASS is not in the container log"
+    fi
+    if docker exec "$fresh" grep -rqsF -- "$fresh_pass" /home/appbox/data /home/appbox/public_html /home/appbox/logs; then
+        fail "ADMIN_PASS is stored in plain text on the volumes"
+    else
+        pass "ADMIN_PASS is not stored in plain text on the volumes"
+    fi
+    if login "$fresh" admin "$fresh_pass" | json_ok; then
+        pass "the administrator logs in with ADMIN_PASS through the login API"
+    else
+        fail "the administrator cannot log in with ADMIN_PASS"
+    fi
+    if login "$fresh" admin "$attacker_pass" | json_ok; then
+        fail "the attacker's password logs in as administrator"
+    else
+        pass "the attacker's password does not log in"
+    fi
+    if docker exec "$fresh" curl -s -m 10 -X POST --data "action=user&name=admin&password=Another1!pass" \
+        'http://127.0.0.1/?install/index/save' | grep -Eq '"code": ?false'; then
+        pass "install/index/save is rejected once Kodbox runs"
+    else
+        fail "install/index/save is not rejected once Kodbox runs"
+    fi
+    for _ in $(seq 1 20); do
+        [ "$(callback_requests "$fresh")" -ge 1 ] && break
+        sleep 2
+    done
+    sleep 3
+    callbacks=$(docker exec "$fresh" cat /var/log/gate-callback.log 2>/dev/null)
+    if [ "$(echo "$callbacks" | grep -c .)" -eq 1 ] \
+        && echo "$callbacks" | grep -qF "\"path\": \"/v1/apps/installed/$callback_id?callback_token=$callback_query_token\"" \
+        && echo "$callbacks" | grep -qF "\"token\": \"$callback_header_token\"" \
+        && ! docker exec "$fresh" test -e /etc/appbox_callback_pending; then
+        pass "one installed callback was sent after the install"
+    else
+        fail "installed callback: expected one request, got: $callbacks"
+    fi
+    db_snapshot "$fresh" > "$work_dir/fresh-before-restart" || fail "cannot read the Kodbox database"
+
+    echo "== Restart"
+    docker exec "$fresh" rm -f /var/log/gate-callback.log
+    docker restart -t 20 "$fresh" >/dev/null
+    start_mock "$fresh"
+    if wait_for_web "$fresh"; then
+        pass "the container serves Kodbox after a restart"
+    else
+        fail "the container does not serve Kodbox after a restart"
+    fi
+    sleep 10
+    if [ "$(docker logs "$fresh" 2>&1 | grep -c 'Installing Kodbox')" -eq 1 ] \
+        && [ "$(callback_requests "$fresh")" -eq 0 ]; then
+        pass "the restart neither installs again nor sends another callback"
+    else
+        fail "the restart installed again or sent another callback"
+    fi
+    db_snapshot "$fresh" > "$work_dir/fresh-after-restart" || true
+    if cmp -s "$work_dir/fresh-before-restart" "$work_dir/fresh-after-restart"; then
+        pass "the database and administrator are unchanged by the restart"
+    else
+        fail "the database or administrator changed on restart"
+    fi
+    if login "$fresh" admin "$fresh_pass" | json_ok; then
+        pass "the administrator logs in after the restart"
+    else
+        fail "the administrator cannot log in after the restart"
+    fi
+else
+    fail "the new container did not serve Kodbox (wait result $web)"
+    docker logs "$fresh" 2>&1 | tail -40 | sed "s/$(printf '%s' "$fresh_pass" | sed 's/[]\/$*.^[]/\\&/g')/[password]/g" >&2
+fi
+docker rm -f "$fresh" >/dev/null 2>&1
+
+echo "== Fresh install with a password Kodbox refuses"
+weak=$run_id-weak
+new_volume "$weak-ph"
+new_volume "$weak-data"
+write_env "$work_dir/weak.env" "$weak_pass"
+start_container "$weak" "$image_ref" "$work_dir/weak.env" "$weak-ph" "$weak-data" || die "cannot start $weak"
+for attempt in 1 2; do
+    if wait_for_exit "$weak"; then
+        code=$(docker inspect -f '{{.State.ExitCode}}' "$weak")
+        logs=$(docker logs "$weak" 2>&1)
+        state=$(docker run --rm --network none -v "$weak-ph:/ph" -v "$weak-data:/data" --entrypoint sh "$BASE_IMAGE" \
+            -c 'ls /data/system/install.lock /ph/config/setting_user.php 2>/dev/null | wc -l')
+        pending=absent
+        docker cp "$weak:/etc/appbox_callback_pending" - >/dev/null 2>&1 && pending=present
+        docker cp "$weak:/etc/installer30_completed" - >/dev/null 2>&1 && pending="$pending, installer marked complete"
+        if [ "$code" -ne 0 ] \
+            && [ "$(echo "$logs" | grep -c 'kod.sh: Kodbox installation failed')" -eq "$attempt" ] \
+            && ! echo "$logs" | grep -q 'Booting runit' \
+            && [ "$state" = 0 ] && [ "$pending" = absent ]; then
+            pass "start $attempt: the container stopped (exit $code) before serving anything, with no callback marked and no install.lock"
+        else
+            fail "start $attempt: exit $code, install files $state, callback flag $pending"
+        fi
+    else
+        fail "start $attempt: the container is still running with a refused password"
+    fi
+    [ "$attempt" -eq 1 ] && docker start "$weak" >/dev/null
+done
+docker rm -f "$weak" >/dev/null 2>&1
+
+echo "== Upgrade from 1.70.02-1 on the same volumes"
+up=$run_id-up
+new_volume "$up-ph"
+new_volume "$up-data"
+# 1.70.02-1 installs over HTTP_DOMAIN; point it at the container itself. Its
+# kod.sh traces its last command (rm -rf /code_sources) when it is done; the
+# callback loop after it then waits forever for api.cylo.io (no network),
+# which is fine: the volumes hold an installed Kodbox.
+write_env "$work_dir/old.env" "$old_pass" http://127.0.0.1
+start_container "$up-old" "$BASE_IMAGE" "$work_dir/old.env" "$up-ph" "$up-data" || die "cannot start $up-old"
+if wait_for_log "$up-old" "+ rm -rf /code_sources" \
+    && docker exec "$up-old" test -f /home/appbox/data/system/install.lock; then
+    pass "1.70.02-1 installed Kodbox on the new volumes"
+    docker exec "$up-old" sh -c '/usr/sbin/php-fpm8.3 --fpm-config /home/appbox/config/php-fpm/php-fpm.conf; /usr/sbin/nginx -c /home/appbox/config/nginx/nginx.conf'
+    wait_for_web "$up-old" || fail "1.70.02-1 does not serve Kodbox"
+    token=$(login "$up-old" admin "$old_pass" | python3 -c 'import json, sys; d = json.load(sys.stdin); print(d["info"] if d.get("code") is True else "")' 2>/dev/null)
+    role=$(db_snapshot "$up-old" | awk -F'|' '$1 == "1" {print $3}')
+    added=$(docker exec "$up-old" curl -s -m 60 --data-urlencode "name=$second_user" \
+        --data-urlencode "password=$second_pass" --data-urlencode "roleID=$role" \
+        --data-urlencode 'groupInfo={"1":"1"}' --data-urlencode 'sizeMax=0' \
+        "http://127.0.0.1/?admin/member/add&accessToken=$token")
+    if [ -n "$token" ] && echo "$added" | json_ok && login "$up-old" "$second_user" "$second_pass" | json_ok; then
+        pass "1.70.02-1: the administrator logs in and adds user $second_user"
+    else
+        fail "1.70.02-1: could not log in and add a user: $added"
+    fi
+    docker exec "$up-old" sh -c 'echo gate-marker > /home/appbox/data/gate-marker.txt'
+    db_snapshot "$up-old" > "$work_dir/up-before" || fail "cannot read the 1.70.02-1 database"
+    docker rm -f "$up-old" >/dev/null
+
+    write_env "$work_dir/new.env" "$new_pass"
+    start_container "$up-new" "$image_ref" "$work_dir/new.env" "$up-ph" "$up-data" || die "cannot start $up-new"
+    start_mock "$up-new"
+    if wait_for_web "$up-new"; then
+        pass "the candidate serves Kodbox on the 1.70.02-1 volumes"
+        logs=$(docker logs "$up-new" 2>&1)
+        if echo "$logs" | grep -q '^Kodbox is already installed: keeping the existing data and administrator$' \
+            && ! echo "$logs" | grep -q 'Kodbox install step'; then
+            pass "the update kept the installation and ran no install step"
+        else
+            fail "the update ran an install step"
+        fi
+        db_snapshot "$up-new" > "$work_dir/up-after" || true
+        if [ -s "$work_dir/up-before" ] && cmp -s "$work_dir/up-before" "$work_dir/up-after"; then
+            pass "database file, users, roles and password hashes are unchanged ($(grep -c '|' "$work_dir/up-after") users)"
+        else
+            fail "the database changed on update"
+            diff "$work_dir/up-before" "$work_dir/up-after" | sed 's/|[^|]*$/|<hash>/' >&2
+        fi
+        if [ "$(docker exec "$up-new" cat /home/appbox/data/gate-marker.txt 2>/dev/null)" = gate-marker ]; then
+            pass "files on the data volume are kept"
+        else
+            fail "a file on the data volume was lost"
+        fi
+        if login "$up-new" admin "$old_pass" | json_ok && login "$up-new" "$second_user" "$second_pass" | json_ok; then
+            pass "the administrator and $second_user log in with their 1.70.02-1 passwords"
+        else
+            fail "a 1.70.02-1 login no longer works after the update"
+        fi
+        if login "$up-new" admin "$new_pass" | json_ok; then
+            fail "the update reset the administrator password to ADMIN_PASS"
+        else
+            pass "the update did not reset the administrator password"
+        fi
+        if docker exec "$up-new" curl -s -m 10 -X POST --data "action=user&name=admin&password=Another1!pass" \
+            'http://127.0.0.1/?install/index/save' | grep -Eq '"code": ?false'; then
+            pass "install/index/save is rejected after the update"
+        else
+            fail "install/index/save is not rejected after the update"
+        fi
+        for _ in $(seq 1 20); do
+            [ "$(callback_requests "$up-new")" -ge 1 ] && break
+            sleep 2
+        done
+        if [ "$(callback_requests "$up-new")" -eq 1 ]; then
+            pass "the update sent one installed callback"
+        else
+            fail "the update sent $(callback_requests "$up-new") installed callbacks, expected 1"
+        fi
+        if logs_contain_secret "$up-new" "$new_pass"; then
+            fail "ADMIN_PASS appears in the updated container's log"
+        else
+            pass "ADMIN_PASS is not in the updated container's log"
+        fi
+    else
+        fail "the candidate does not serve Kodbox on the 1.70.02-1 volumes"
+        docker logs "$up-new" 2>&1 | tail -40 >&2
+    fi
+else
+    fail "1.70.02-1 did not install Kodbox"
+fi
 
 echo "== Registry tag must not exist"
 registry=${registry_ref%%/*}
@@ -250,19 +552,17 @@ tag=${repository_and_tag##*:}
 
 registry_auth=$(jq -r --arg host "$registry" '.auths[$host].auth // empty' "$HOME/.docker/config.json")
 [ -n "$registry_auth" ] || die "no stored credentials for $registry"
-
 registry_body="$work_dir/registry-body"
-
 registry_get() {
     printf 'header = "Authorization: Basic %s"\n' "$registry_auth" \
         | curl -sS -K - -o "$registry_body" -w '%{http_code}' \
             -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json' \
             "https://$registry$1"
 }
-
 api_status=$(registry_get /v2/) || die "registry unreachable"
 [ "$api_status" = 200 ] || die "registry API check returned HTTP $api_status"
-
+base_status=$(registry_get "/v2/$repository/manifests/1.70.02-1") || die "registry unreachable"
+[ "$base_status" = 200 ] || die "registry cannot read the existing 1.70.02-1 tag (HTTP $base_status); state is indeterminate"
 manifest_status=$(registry_get "/v2/$repository/manifests/$tag") || die "registry unreachable"
 case "$manifest_status" in
     200) fail "$registry_ref already exists in the registry" ;;
