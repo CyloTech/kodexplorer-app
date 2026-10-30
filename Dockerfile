@@ -1,26 +1,19 @@
-# Kodbox 1.70.02-2: the deployed kodbox:1.70.02-1 image with a new first-start
-# installer.
+# Kodbox 1.70.03: the deployed kodbox:1.70.02-2 image with Kodbox 1.70.03 in
+# /kod_sources.
 #
-# The base is the exact image every 1.70.02-1 instance runs, pinned by digest,
-# so Kodbox (/kod_sources), PHP 8.3 with the 21 October 2026 fixes, the
-# packages, the configuration, CMD and environment stay as they were. Only the
-# install scripts change: kod.sh installs Kodbox through index.php's
-# command-line entry point before nginx and PHP-FPM start, instead of over HTTP
-# through the public domain once they are running.
+# The base is the exact image every 1.70.02-2 instance runs, pinned by digest,
+# so PHP 8.3, the packages, the configuration, the install scripts, the
+# installed-callback service, CMD and environment stay as they were. Only
+# /kod_sources changes: it is upstream Kodbox 1.70.03 with the Appbox changes,
+# CyloTech/kodbox branch appbox-1.70.03, pinned by commit. kod.sh copies it
+# into public_html on the first start of each new container and keeps
+# config/setting_user.php and the data volume, as for earlier releases.
 #
 # release/verify-image.sh is the release gate.
 
-FROM repo.cylo.net/kodbox@sha256:8e6cd075d8e360f5b0d8832b077ee315c2fd9544fc795e7be96181c227bd16ed
+FROM repo.cylo.net/kodbox@sha256:60e5b07d8db4e8bafe723c856f374a8c11884fb4c83349f52c2e56293f564d51
 
-COPY --chmod=755 scripts/kod.sh /scripts/install/kod.sh
-COPY --chmod=644 scripts/kodbox-install-step.php /scripts/install/kodbox-install-step.php
-COPY --chmod=644 scripts/kodbox-install-check.php /scripts/install/kodbox-install-check.php
-COPY --chmod=755 scripts/30_installer.sh /etc/my_init.d/30_installer.sh
+RUN rm -rf /kod_sources
+ADD https://github.com/CyloTech/kodbox.git#a48bafa0b601731e0b16f15f5f696598edeb36eb /kod_sources
 
-# Appbox installed callback: 30_installer.sh only marks it pending and this
-# runit service sends it after my_init.d, so it can never block startup.
-COPY scripts/appbox-installed-callback /usr/local/bin/appbox-installed-callback
-COPY scripts/appbox-callback-run /etc/service/appbox-callback/run
-RUN chmod 755 /usr/local/bin/appbox-installed-callback /etc/service/appbox-callback/run
-
-LABEL net.cylo.kodbox-release="1.70.02-2"
+LABEL net.cylo.kodbox-release="1.70.03"
