@@ -1,4 +1,10 @@
-# Nothing from the repository goes into the image: the base is the pinned
-# 1.70.02-2 image (install scripts included) and /kod_sources comes from the
-# pinned CyloTech/kodbox commit in the Dockerfile.
+# Only the install scripts go into the image; everything else comes from the
+# pinned 1.70.02-2 base and the pinned
+# CyloTech/kodbox commit in the Dockerfile.
 *
+!scripts/kod.sh
+!scripts/30_installer.sh
+!scripts/kodbox-install-step.php
+!scripts/kodbox-install-check.php
+!scripts/appbox-installed-callback
+!scripts/appbox-callback-run
